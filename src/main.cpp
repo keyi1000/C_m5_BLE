@@ -25,6 +25,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
   void onDisconnect(BLEServer* pServer) {
     isConnected = false;
     Serial.println("Device disconnected");
+    connectionCount--;
     // 切断されたら再度アドバタイズ開始
     BLEDevice::startAdvertising();
   }
