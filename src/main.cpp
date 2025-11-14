@@ -4,9 +4,12 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/rsa.h>
+#include <mbedtls/md.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/error.h>
+#include <mbedtls/base64.h>
 #include <LittleFS.h>
 #define SPIFFS LittleFS
 
@@ -27,6 +30,10 @@ bool rsaInitialized = false;
 String lastMessage = "";
 int messageCount = 0;
 bool messageDisplayed = false;  // メッセージが表示されているか
+
+// 受信データキュー
+String receivedData = "";
+bool hasNewData = false;
 
 // 時間計測用
 unsigned long startTime = 0;
@@ -84,35 +91,6 @@ void updateData(const char* data) {
   drawLabel(data, 10, 100, 2, TFT_YELLOW, TFT_BLACK);
 }
 
-// メッセージ履歴を表示
-void displayMessage(const char* message) {
-  // 画面をクリアして再描画
-  fillScreen(TFT_GREEN);
-  
-  // ヘッダー
-  drawLabel("Message Received!", 10, 10, 2, TFT_WHITE, TFT_GREEN);
-  
-  // メッセージカウント
-  char countBuf[32];
-  snprintf(countBuf, sizeof(countBuf), "Count: %d", messageCount);
-  drawLabel(countBuf, 10, 40, 2, TFT_YELLOW, TFT_GREEN);
-  
-  // 受信メッセージ（複数行対応）
-  M5.Display.setTextColor(TFT_BLACK, TFT_GREEN);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 80);
-  M5.Display.println("Message:");
-  
-  // メッセージを表示（長い場合は折り返し）
-  M5.Display.setCursor(10, 110);
-  M5.Display.setTextSize(3);
-  M5.Display.setTextColor(TFT_WHITE, TFT_GREEN);
-  M5.Display.println(message);
-  
-  lastMessage = String(message);
-  messageDisplayed = true;  // メッセージ表示フラグをON
-}
-
 // RSA秘密鍵の初期化
 bool initRSA() {
   mbedtls_pk_init(&pk);
@@ -159,29 +137,160 @@ bool initRSA() {
   return true;
 }
 
-// RSAで復号化
+// RSAで復号化 (OAEP padding with SHA256)
 bool decryptRSA(const uint8_t* encryptedData, size_t encryptedLen, uint8_t* decryptedData, size_t* decryptedLen) {
   if (!rsaInitialized) {
     Serial.println("RSA not initialized");
     return false;
   }
   
-  int ret = mbedtls_pk_decrypt(&pk, encryptedData, encryptedLen,
-                                decryptedData, decryptedLen, 256,
-                                mbedtls_ctr_drbg_random, &ctr_drbg);
+  Serial.printf("Attempting RSA decryption with OAEP-SHA256...\n");
+  Serial.printf("Encrypted data length: %d bytes\n", encryptedLen);
+  Serial.printf("Output buffer size: %d bytes\n", *decryptedLen);
+  
+  // RSAコンテキストを取得
+  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(pk);
+  if (!rsa) {
+    Serial.println("Failed to get RSA context");
+    return false;
+  }
+  
+  // OAEP-SHA256パディングを設定
+  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA256);
+  
+  // RSA復号化を実行
+  int ret = mbedtls_rsa_rsaes_oaep_decrypt(rsa, mbedtls_ctr_drbg_random, &ctr_drbg,
+                                            MBEDTLS_RSA_PRIVATE, NULL, 0,
+                                            decryptedLen, encryptedData,
+                                            decryptedData, *decryptedLen);
   
   if (ret != 0) {
     char error_buf[100];
     mbedtls_strerror(ret, error_buf, sizeof(error_buf));
     Serial.printf("Decryption failed: -0x%04x (%s)\n", -ret, error_buf);
+    
+    // 一般的なエラーコードの説明
+    if (ret == -0x4080) {
+      Serial.println("Error: MBEDTLS_ERR_RSA_INVALID_PADDING - Padding verification failed");
+      Serial.println("This usually means the data was encrypted with a different padding scheme");
+    } else if (ret == -0x4100) {
+      Serial.println("Error: MBEDTLS_ERR_RSA_BAD_INPUT_DATA - Input data is invalid");
+    }
+    
     return false;
   }
   
+  Serial.printf("Decryption succeeded, output length: %d bytes\n", *decryptedLen);
   return true;
+}
+
+// Base64デコード関数
+bool base64Decode(const char* input, size_t inputLen, uint8_t* output, size_t* outputLen) {
+  size_t olen;
+  int ret = mbedtls_base64_decode(output, *outputLen, &olen, (const unsigned char*)input, inputLen);
+  if (ret == 0) {
+    *outputLen = olen;
+    return true;
+  }
+  Serial.printf("Base64 decode failed: -0x%04x\n", -ret);
+  return false;
+}
+
+// メッセージ履歴を表示
+void displayMessage(const char* message) {
+  // 画面をクリアして再描画
+  fillScreen(TFT_GREEN);
+  
+  String decryptedText = "";
+  
+  // RSAが有効な場合は復号化を試みる
+  if (rsaInitialized && strlen(message) > 100) {
+    Serial.println("\n--- RSA Decryption Process ---");
+    Serial.printf("Input length: %d bytes\n", strlen(message));
+    Serial.printf("Free heap before: %d bytes\n", ESP.getFreeHeap());
+    
+    // Base64デコード用のバッファをヒープに確保
+    uint8_t* encryptedData = (uint8_t*)malloc(512);
+    if (!encryptedData) {
+      Serial.println("Failed to allocate memory for encrypted data");
+      decryptedText = "[Memory Error]";
+    } else {
+      size_t encryptedLen = 512;
+      
+      if (base64Decode(message, strlen(message), encryptedData, &encryptedLen)) {
+        Serial.printf("Base64 decoded: %d bytes\n", encryptedLen);
+        
+        // 復号化データの最初の16バイトを16進数で表示
+        Serial.print("Encrypted data (hex, first 32 bytes): ");
+        for (int i = 0; i < min(32, (int)encryptedLen); i++) {
+          Serial.printf("%02X ", encryptedData[i]);
+        }
+        Serial.println();
+        
+        // RSA復号化用のバッファをヒープに確保
+        uint8_t* decryptedData = (uint8_t*)malloc(256);
+        if (!decryptedData) {
+          Serial.println("Failed to allocate memory for decrypted data");
+          decryptedText = "[Memory Error]";
+        } else {
+          size_t decryptedLen = 256;
+          
+          Serial.printf("RSA key size: %d bits\n", mbedtls_pk_get_bitlen(&pk));
+          Serial.printf("Expected encrypted size: %d bytes (for 2048-bit RSA)\n", 256);
+          Serial.printf("Actual encrypted size: %d bytes\n", encryptedLen);
+          
+          if (decryptRSA(encryptedData, encryptedLen, decryptedData, &decryptedLen)) {
+            decryptedData[decryptedLen] = '\0';
+            decryptedText = String((char*)decryptedData);
+            Serial.printf("Decryption successful: %s\n", decryptedText.c_str());
+            Serial.println("--- End Decryption ---\n");
+          } else {
+            decryptedText = "[Decryption Failed]";
+            Serial.println("--- Decryption Failed ---\n");
+            Serial.println("Possible reasons:");
+            Serial.println("1. Wrong padding (expecting OAEP with SHA256)");
+            Serial.println("2. Encrypted with different public key");
+            Serial.println("3. Data corrupted during transmission");
+          }
+          free(decryptedData);
+        }
+      } else {
+        decryptedText = "[Base64 Decode Failed]";
+        Serial.println("--- Base64 Decode Failed ---\n");
+      }
+      free(encryptedData);
+    }
+    Serial.printf("Free heap after: %d bytes\n", ESP.getFreeHeap());
+  } else {
+    // RSAが無効または短いデータの場合はそのまま表示
+    decryptedText = String(message);
+    if (!rsaInitialized) {
+      Serial.println("RSA not initialized - displaying raw data");
+    }
+  }
+  
+  // 復号化されたテキストを表示
+  M5.Display.setTextColor(TFT_BLACK, TFT_GREEN);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 10);
+  M5.Display.println("Decrypted Message:");
+  
+  // メッセージを表示(長い場合は折り返し)
+  M5.Display.setCursor(10, 50);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(TFT_WHITE, TFT_GREEN);
+  M5.Display.println(decryptedText);
+  
+  lastMessage = decryptedText;
+  messageDisplayed = true;  // メッセージ表示フラグをON
 }
 
 // BLE Characteristicコールバッククラス
 class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *pCharacteristic) {
+    Serial.println("📖 Characteristic READ by client");
+  }
+  
   void onWrite(BLECharacteristic *pCharacteristic) {
     Serial.println("\n========================================");
     Serial.println("📩 DATA RECEIVED!");
@@ -192,40 +301,37 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
     if (value.length() > 0) {
       Serial.printf("Length: %d bytes\n", value.length());
       
-      // 16進数で表示
-      Serial.print("Hex: ");
-      for (int i = 0; i < value.length(); i++) {
-        Serial.printf("%02X ", (uint8_t)value[i]);
-      }
-      Serial.println();
-      
-      // 文字列として表示
-      Serial.print("Text: ");
-      Serial.println(value.c_str());
-      Serial.println("========================================\n");
-      
-      // 受信したデータをそのまま表示
+      // データをグローバル変数に保存（loop()で処理）
+      receivedData = String(value.c_str());
+      hasNewData = true;
       messageCount++;
-      displayMessage(value.c_str());
       
       pCharacteristic->setValue("Received!");
       pCharacteristic->notify();
       
-      Serial.println("✓ Displayed on screen and sent response");
+      Serial.println("✓ Data queued for processing");
     } else {
       Serial.println("⚠️  Empty data received");
     }
+    Serial.println("========================================\n");
   }
 };
 
 void setup() {
+  // シリアル通信の初期化
+  Serial.begin(115200);
+  delay(1000);  // シリアル接続が安定するまで待機
+  
   // M5Stackの初期化
   M5.begin();
   M5.Display.setRotation(1);
   fillScreen(TFT_BLACK);
   
-  updateStatus("Starting...");
+  Serial.println("\n\n");
+  Serial.println("========================================");
   Serial.println("=== M5Stack BLE RSA Encryption ===");
+  Serial.println("========================================");
+  updateStatus("Starting...");
   delay(1000);
   
   // SPIFFS初期化（オプション）
@@ -276,6 +382,11 @@ void setup() {
     // BLEサーバーの作成
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
+    
+    // MTUサイズを増やす（最大512バイト）
+    BLEDevice::setMTU(512);
+    Serial.println("MTU size set to 512 bytes");
+    
     delay(1000);
     
     updateStatus("Set IRQ...");
@@ -284,15 +395,19 @@ void setup() {
     // BLEサービスの作成(UUIDは例)
     BLEService *pService = pServer->createService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
     
-    // BLE Characteristicの作成(データ送受信用、Notifyサポート)
+    // BLE Characteristicの作成(データ送受信用、全てのWriteプロパティを有効化)
     pCharacteristic = pService->createCharacteristic(
                                            "beb5483e-36e1-4688-b7f5-ea07361b26a8",
                                            BLECharacteristic::PROPERTY_READ |
                                            BLECharacteristic::PROPERTY_WRITE |
+                                           BLECharacteristic::PROPERTY_WRITE_NR |
                                            BLECharacteristic::PROPERTY_NOTIFY
                                          );
     pCharacteristic->addDescriptor(new BLE2902());
     pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+    
+    Serial.println("Characteristic created with UUID: beb5483e-36e1-4688-b7f5-ea07361b26a8");
+    Serial.println("Properties: READ, WRITE, WRITE_NR, NOTIFY");
     
     if (rsaInitialized) {
       pCharacteristic->setValue("Ready for encrypted data");
@@ -326,12 +441,20 @@ void setup() {
       updateInfo("RSA: Disabled");
     }
     
-    Serial.println("BLE Ready - waiting for connection");
+    Serial.println("\n========================================");
+    Serial.println("BLE Server Ready!");
+    Serial.println("========================================");
+    Serial.println("Device Name: M5Stack-BLE");
+    Serial.println("Service UUID: 4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+    Serial.println("Characteristic UUID: beb5483e-36e1-4688-b7f5-ea07361b26a8");
     if (rsaInitialized) {
-      Serial.println("RSA encryption is enabled");
+      Serial.println("RSA Status: Enabled");
     } else {
-      Serial.println("RSA encryption is disabled");
-    };
+      Serial.println("RSA Status: Disabled");
+    }
+    Serial.println("========================================");
+    Serial.println("Waiting for BLE connection...");
+    Serial.println("========================================\n");
     
     startTime = millis();
     lastUpdate = millis();
@@ -349,6 +472,25 @@ void loop() {
   M5.update();
   
   unsigned long currentTime = millis();
+  
+  // 新しいデータを受信した場合は処理
+  if (hasNewData) {
+    hasNewData = false;
+    Serial.println("Processing received data in loop()...");
+    
+    // データサイズチェック
+    if (receivedData.length() < 100) {
+      fillScreen(TFT_ORANGE);
+      drawLabel("Data Received", 10, 20, 2, TFT_WHITE, TFT_ORANGE);
+      char buf[64];
+      snprintf(buf, sizeof(buf), "Size: %d bytes", receivedData.length());
+      drawLabel(buf, 10, 60, 2, TFT_BLACK, TFT_ORANGE);
+      drawLabel("WARNING:", 10, 100, 2, TFT_RED, TFT_ORANGE);
+      drawLabel("Data too short!", 10, 130, 2, TFT_RED, TFT_ORANGE);
+    } else {
+      displayMessage(receivedData.c_str());
+    }
+  }
   
   // 接続状態が変化したら画面更新
   if (isConnected != lastState) {
@@ -384,7 +526,7 @@ void loop() {
     lastState = isConnected;
   }
   
-  // 5秒ごとに経過時間を画面表示（メッセージ表示中は表示しない）
+  // 5秒ごとに経過時間を画面表示(メッセージ表示中は表示しない)
   if (!messageDisplayed && currentTime - lastUpdate >= 5000) {
     // 接続待機中のみ時間を表示
     if (!isConnected) {
