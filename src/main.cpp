@@ -281,6 +281,27 @@ void displayMessage(const char* message) {
   M5.Display.setTextColor(TFT_WHITE, TFT_GREEN);
   M5.Display.println(decryptedText);
   
+  // 暗号化データを表示(最初の60文字のみ)
+  int messageHeight = M5.Display.getCursorY();
+  M5.Display.setCursor(10, messageHeight + 10);
+  M5.Display.setTextSize(1.5);
+  M5.Display.setTextColor(TFT_YELLOW, TFT_GREEN);
+  M5.Display.println("Encrypted (Base64):");
+  
+  M5.Display.setCursor(10, M5.Display.getCursorY());
+  M5.Display.setTextColor(TFT_WHITE, TFT_GREEN);
+  String encryptedPreview = String(message);
+  if (encryptedPreview.length() > 60) {
+    encryptedPreview = encryptedPreview.substring(0, 60) + "...";
+  }
+  M5.Display.println(String(message));
+  
+  // RSA暗号化方式の表示
+  M5.Display.setCursor(10, M5.Display.getCursorY() + 5);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(TFT_CYAN, TFT_GREEN);
+  M5.Display.println("RSA-2048 OAEP-SHA256");
+  
   lastMessage = decryptedText;
   messageDisplayed = true;  // メッセージ表示フラグをON
 }
